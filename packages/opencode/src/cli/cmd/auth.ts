@@ -10,9 +10,54 @@ import { Config } from "../../config/config"
 import { Global } from "../../global"
 import { Plugin } from "../../plugin"
 import { Instance } from "../../project/instance"
+import * as CodexAccounts from "../../auth/codex-accounts"
 import type { Hooks } from "@opencode-ai/plugin"
 
 type PluginAuth = NonNullable<Hooks["auth"]>
+
+function canPromptMore(): boolean {
+  return !!process.stdout.isTTY && process.env.OPENCODE_NON_INTERACTIVE !== "1" && process.env.CI !== "1"
+}
+
+async function maybePromptCodexAccounts(provider: string): Promise<void> {
+  if (provider !== "openai" || !canPromptMore()) return
+  const existingAuth = await Auth.get(provider)
+  if (existingAuth?.type === "oauth") {
+    await CodexAccounts.ensure({
+      refresh: existingAuth.refresh,
+      access: existingAuth.access,
+      expires: existingAuth.expires,
+      accountId: existingAuth.accountId,
+    })
+  }
+  const store = await CodexAccounts.read()
+  if (store.accounts.length === 0) return
+
+  prompts.log.info("Accounts currently logged in:")
+  store.accounts.forEach((account, index) => {
+    const email = account.email
+    const accountId = account.accountId
+    const label =
+      email && accountId
+        ? `${email} ${UI.Style.TEXT_DIM}(${accountId})`
+        : email || accountId || `Account ${index + 1}`
+    prompts.log.info(`${index + 1}. ${label}`)
+  })
+
+  const choice = await prompts.select({
+    message: "Do you want to add new accounts or start fresh?",
+    options: [
+      { label: "Add new accounts", value: "add" },
+      { label: "Start fresh (remove stored accounts)", value: "fresh" },
+    ],
+  })
+  if (prompts.isCancel(choice)) throw new UI.CancelledError()
+  if (choice === "fresh") {
+    await CodexAccounts.clear()
+    await Auth.remove(provider)
+    prompts.log.success("Cleared stored Codex accounts")
+  }
+}
 
 /**
  * Handle plugin-based authentication flow.
@@ -63,23 +108,25 @@ async function handlePluginAuth(plugin: { auth: PluginAuth }, provider: string):
   }
 
   if (method.type === "oauth") {
-    const authorize = await method.authorize(inputs)
+    await maybePromptCodexAccounts(provider)
+    const runOauth = async (): Promise<boolean> => {
+      const authorize = await method.authorize(inputs)
 
-    if (authorize.url) {
-      prompts.log.info("Go to: " + authorize.url)
-    }
+      if (authorize.url) {
+        prompts.log.info("Go to: " + authorize.url)
+      }
 
-    if (authorize.method === "auto") {
-      if (authorize.instructions) {
-        prompts.log.info(authorize.instructions)
-      }
-      const spinner = prompts.spinner()
-      spinner.start("Waiting for authorization...")
-      const result = await authorize.callback()
-      if (result.type === "failed") {
-        spinner.stop("Failed to authorize", 1)
-      }
-      if (result.type === "success") {
+      if (authorize.method === "auto") {
+        if (authorize.instructions) {
+          prompts.log.info(authorize.instructions)
+        }
+        const spinner = prompts.spinner()
+        spinner.start("Waiting for authorization...")
+        const result = await authorize.callback()
+        if (result.type === "failed") {
+          spinner.stop("Failed to authorize", 1)
+          return false
+        }
         const saveProvider = result.provider ?? provider
         if ("refresh" in result) {
           const { type: _, provider: __, refresh, access, expires, ...extraFields } = result
@@ -98,20 +145,20 @@ async function handlePluginAuth(plugin: { auth: PluginAuth }, provider: string):
           })
         }
         spinner.stop("Login successful")
+        return true
       }
-    }
 
-    if (authorize.method === "code") {
-      const code = await prompts.text({
-        message: "Paste the authorization code here: ",
-        validate: (x) => (x && x.length > 0 ? undefined : "Required"),
-      })
-      if (prompts.isCancel(code)) throw new UI.CancelledError()
-      const result = await authorize.callback(code)
-      if (result.type === "failed") {
-        prompts.log.error("Failed to authorize")
-      }
-      if (result.type === "success") {
+      if (authorize.method === "code") {
+        const code = await prompts.text({
+          message: "Paste the authorization code here: ",
+          validate: (x) => (x && x.length > 0 ? undefined : "Required"),
+        })
+        if (prompts.isCancel(code)) throw new UI.CancelledError()
+        const result = await authorize.callback(code)
+        if (result.type === "failed") {
+          prompts.log.error("Failed to authorize")
+          return false
+        }
         const saveProvider = result.provider ?? provider
         if ("refresh" in result) {
           const { type: _, provider: __, refresh, access, expires, ...extraFields } = result
@@ -130,7 +177,32 @@ async function handlePluginAuth(plugin: { auth: PluginAuth }, provider: string):
           })
         }
         prompts.log.success("Login successful")
+        return true
       }
+
+      return false
+    }
+
+    const ok = await runOauth()
+    if (!ok) {
+      prompts.outro("Done")
+      return true
+    }
+
+    const shouldPrompt = provider === "openai" && canPromptMore()
+    if (!shouldPrompt) {
+      prompts.outro("Done")
+      return true
+    }
+
+    for (;;) {
+      const add = await prompts.confirm({
+        message: "Log into another account?",
+        initialValue: false,
+      })
+      if (prompts.isCancel(add) || !add) break
+      const added = await runOauth()
+      if (!added) break
     }
 
     prompts.outro("Done")

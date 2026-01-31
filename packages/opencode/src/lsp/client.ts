@@ -113,7 +113,7 @@ export namespace LSPClient {
           },
         },
       }),
-      45_000,
+      900_000,
     ).catch((err) => {
       l.error("initialize error", { error: err })
       throw new InitializeError(
@@ -228,7 +228,7 @@ export namespace LSPClient {
               }
             })
           }),
-          3000,
+          600_000,
         )
           .catch(() => {})
           .finally(() => {

@@ -1,7 +1,8 @@
 import type { Hooks, PluginInput } from "@opencode-ai/plugin"
 import { Log } from "../util/log"
 import { Installation } from "../installation"
-import { Auth, OAUTH_DUMMY_KEY } from "../auth"
+import { OAUTH_DUMMY_KEY } from "../auth"
+import * as Store from "../auth/codex-accounts"
 import os from "os"
 
 const log = Log.create({ service: "plugin.codex" })
@@ -44,6 +45,12 @@ function generateState(): string {
   return base64UrlEncode(crypto.getRandomValues(new Uint8Array(32)).buffer)
 }
 
+function resolveCodexEndpoint(): string {
+  const value = process.env.OPENCODE_CODEX_ENDPOINT
+  if (value && value.length > 0) return value
+  return CODEX_API_ENDPOINT
+}
+
 export interface IdTokenClaims {
   chatgpt_account_id?: string
   organizations?: Array<{ id: string }>
@@ -80,6 +87,33 @@ export function extractAccountId(tokens: TokenResponse): string | undefined {
   if (tokens.access_token) {
     const claims = parseJwtClaims(tokens.access_token)
     return claims ? extractAccountIdFromClaims(claims) : undefined
+  }
+  return undefined
+}
+
+function extractEmailFromClaims(claims: IdTokenClaims | undefined): string | undefined {
+  const email = claims?.email
+  if (typeof email === "string" && email.includes("@")) {
+    return email.toLowerCase()
+  }
+  return undefined
+}
+
+function extractEmailFromToken(token: string): string | undefined {
+  if (!token) return
+  const claims = parseJwtClaims(token)
+  return extractEmailFromClaims(claims)
+}
+
+function extractEmailFromTokens(tokens: TokenResponse): string | undefined {
+  if (tokens.id_token) {
+    const claims = parseJwtClaims(tokens.id_token)
+    const email = extractEmailFromClaims(claims)
+    if (email) return email
+  }
+  if (tokens.access_token) {
+    const claims = parseJwtClaims(tokens.access_token)
+    return extractEmailFromClaims(claims)
   }
   return undefined
 }
@@ -139,6 +173,73 @@ async function refreshAccessToken(refreshToken: string): Promise<TokenResponse> 
     throw new Error(`Token refresh failed: ${response.status}`)
   }
   return response.json()
+}
+
+async function ensureAccountAccess(
+  store: Store.Store,
+  index: number,
+): Promise<{ store: Store.Store; account: Store.Account; index: number }> {
+  const account = store.accounts[index]
+  if (!account) {
+    throw new Error(`No account found at index ${index}`)
+  }
+  const time = Date.now()
+  if (account.access && account.expires && account.expires - Store.COOLDOWN.skew > time) {
+    return { store, account, index }
+  }
+
+  log.info("refreshing codex access token", { index })
+  const tokens = await refreshAccessToken(account.refresh)
+  const insert = Store.upsert(store, {
+    refresh: tokens.refresh_token,
+    access: tokens.access_token,
+    expires: Date.now() + (tokens.expires_in ?? 3600) * 1000,
+    accountId: extractAccountId(tokens) ?? account.accountId,
+    email: extractEmailFromTokens(tokens) ?? account.email,
+  })
+  const next = insert.store.accounts[insert.index]
+  if (!next) {
+    throw new Error(`Missing account after refresh at index ${insert.index}`)
+  }
+  return { store: insert.store, account: next, index: insert.index }
+}
+
+async function persistActiveAuth(client: PluginInput["client"], account: Store.Account): Promise<void> {
+  if (!account.access) return
+  await client.auth.set({
+    path: { id: "openai" },
+    body: {
+      type: "oauth",
+      refresh: account.refresh,
+      access: account.access,
+      expires: account.expires ?? Date.now() + 60 * 60 * 1000,
+      ...(account.accountId ? { accountId: account.accountId } : {}),
+    },
+  })
+}
+
+function buildHeaders(init?: RequestInit): Headers {
+  const headers = new Headers()
+  if (!init?.headers) return headers
+  if (init.headers instanceof Headers) {
+    init.headers.forEach((value, key) => {
+      if (key.toLowerCase() === "authorization") return
+      headers.set(key, value)
+    })
+    return headers
+  }
+  if (Array.isArray(init.headers)) {
+    for (const [key, value] of init.headers) {
+      if (key.toLowerCase() === "authorization" || value === undefined) continue
+      headers.set(key, String(value))
+    }
+    return headers
+  }
+  for (const [key, value] of Object.entries(init.headers)) {
+    if (key.toLowerCase() === "authorization" || value === undefined) continue
+    headers.set(key, String(value))
+  }
+  return headers
 }
 
 const HTML_SUCCESS = `<!doctype html>
@@ -348,12 +449,22 @@ function waitForOAuthCallback(pkce: PkceCodes, state: string): Promise<TokenResp
 }
 
 export async function CodexAuthPlugin(input: PluginInput): Promise<Hooks> {
+  let accountStore: Store.Store | undefined
   return {
     auth: {
       provider: "openai",
       async loader(getAuth, provider) {
         const auth = await getAuth()
         if (auth.type !== "oauth") return {}
+        const email = extractEmailFromToken(auth.access)
+        const authAccount = auth as typeof auth & { accountId?: string }
+        accountStore = await Store.ensure({
+          refresh: auth.refresh,
+          access: auth.access,
+          expires: auth.expires,
+          accountId: authAccount.accountId,
+          email,
+        })
 
         // Filter models to only allowed Codex models for OAuth
         const allowedModels = new Set([
@@ -381,82 +492,129 @@ export async function CodexAuthPlugin(input: PluginInput): Promise<Hooks> {
         return {
           apiKey: OAUTH_DUMMY_KEY,
           async fetch(requestInput: RequestInfo | URL, init?: RequestInit) {
-            // Remove dummy API key authorization header
-            if (init?.headers) {
-              if (init.headers instanceof Headers) {
-                init.headers.delete("authorization")
-                init.headers.delete("Authorization")
-              } else if (Array.isArray(init.headers)) {
-                init.headers = init.headers.filter(([key]) => key.toLowerCase() !== "authorization")
-              } else {
-                delete init.headers["authorization"]
-                delete init.headers["Authorization"]
-              }
-            }
-
             const currentAuth = await getAuth()
             if (currentAuth.type !== "oauth") return fetch(requestInput, init)
 
-            // Cast to include accountId field
-            const authWithAccount = currentAuth as typeof currentAuth & { accountId?: string }
-
-            // Check if token needs refresh
-            if (!currentAuth.access || currentAuth.expires < Date.now()) {
-              log.info("refreshing codex access token")
-              const tokens = await refreshAccessToken(currentAuth.refresh)
-              const newAccountId = extractAccountId(tokens) || authWithAccount.accountId
-              await input.client.auth.set({
-                path: { id: "openai" },
-                body: {
-                  type: "oauth",
-                  refresh: tokens.refresh_token,
-                  access: tokens.access_token,
-                  expires: Date.now() + (tokens.expires_in ?? 3600) * 1000,
-                  ...(newAccountId && { accountId: newAccountId }),
-                },
-              })
-              currentAuth.access = tokens.access_token
-              authWithAccount.accountId = newAccountId
+            const email = extractEmailFromToken(currentAuth.access)
+            const authAccount = currentAuth as typeof currentAuth & { accountId?: string }
+            const state = {
+              store:
+                accountStore ??
+                (await Store.ensure({
+                  refresh: currentAuth.refresh,
+                  access: currentAuth.access,
+                  expires: currentAuth.expires,
+                  accountId: authAccount.accountId,
+                  email,
+                })),
             }
+            accountStore = state.store
 
-            // Build headers
-            const headers = new Headers()
-            if (init?.headers) {
-              if (init.headers instanceof Headers) {
-                init.headers.forEach((value, key) => headers.set(key, value))
-              } else if (Array.isArray(init.headers)) {
-                for (const [key, value] of init.headers) {
-                  if (value !== undefined) headers.set(key, String(value))
-                }
-              } else {
-                for (const [key, value] of Object.entries(init.headers)) {
-                  if (value !== undefined) headers.set(key, String(value))
-                }
-              }
-            }
-
-            // Set authorization header with access token
-            headers.set("authorization", `Bearer ${currentAuth.access}`)
-
-            // Set ChatGPT-Account-Id header for organization subscriptions
-            if (authWithAccount.accountId) {
-              headers.set("ChatGPT-Account-Id", authWithAccount.accountId)
-            }
-
-            // Rewrite URL to Codex endpoint
+            const baseHeaders = buildHeaders(init)
             const parsed =
               requestInput instanceof URL
                 ? requestInput
                 : new URL(typeof requestInput === "string" ? requestInput : requestInput.url)
             const url =
               parsed.pathname.includes("/v1/responses") || parsed.pathname.includes("/chat/completions")
-                ? new URL(CODEX_API_ENDPOINT)
+                ? new URL(resolveCodexEndpoint())
                 : parsed
+            if (state.store.accounts.length === 0) {
+              if (!currentAuth.access) return fetch(url, { ...(init ?? {}), headers: baseHeaders })
+              const headers = new Headers(baseHeaders)
+              headers.set("authorization", `Bearer ${currentAuth.access}`)
+              if (authAccount.accountId) {
+                headers.set("ChatGPT-Account-Id", authAccount.accountId)
+              }
+              return fetch(url, { ...(init ?? {}), headers })
+            }
 
-            return fetch(url, {
-              ...init,
-              headers,
-            })
+            const attemptOrder = Store.order(state.store)
+            const failures: Response[] = []
+
+            for (const idx of attemptOrder) {
+              const ensured = await ensureAccountAccess(state.store, idx).catch((err) => {
+                log.error("codex account refresh failed", { index: idx, error: String(err) })
+                if (state.store.accounts[idx]) {
+                  state.store.accounts[idx].cooldownReason = "auth-failure"
+                  state.store.accounts[idx].cooldownUntil = Date.now() + Store.COOLDOWN.auth
+                }
+                return undefined
+              })
+              if (!ensured) continue
+
+              state.store = await Store.write(ensured.store)
+              accountStore = state.store
+              const index = ensured.index
+              const account = state.store.accounts[index]
+              if (!account?.access) continue
+
+              const headers = new Headers(baseHeaders)
+              headers.set("authorization", `Bearer ${account.access}`)
+              if (account.accountId) {
+                headers.set("ChatGPT-Account-Id", account.accountId)
+              }
+
+              const response = await fetch(url, { ...(init ?? {}), headers }).catch((err) => {
+                log.error("codex request failed for account", { index: idx, error: String(err) })
+                return undefined
+              })
+              if (!response) {
+                if (state.store.accounts[index]) {
+                  state.store.accounts[index].cooldownReason = "auth-failure"
+                  state.store.accounts[index].cooldownUntil = Date.now() + Store.COOLDOWN.auth
+                  state.store = await Store.write(state.store)
+                  accountStore = state.store
+                }
+                continue
+              }
+
+              if (response.status === 401 || response.status === 403) {
+                state.store.accounts[index].cooldownReason = "auth-failure"
+                state.store.accounts[index].cooldownUntil = Date.now() + Store.COOLDOWN.auth
+                state.store = await Store.write(state.store)
+                accountStore = state.store
+                log.info("codex account auth failure", {
+                  index,
+                  status: response.status,
+                  cooldownUntil: state.store.accounts[index]?.cooldownUntil,
+                })
+                failures.push(response)
+                continue
+              }
+
+              if (response.status === 429) {
+                state.store.accounts[index].cooldownReason = "rate-limit"
+                state.store.accounts[index].cooldownUntil = Date.now() + Store.retry(response, Store.COOLDOWN.rate)
+                state.store = await Store.write(state.store)
+                accountStore = state.store
+                log.info("codex account rate limited", {
+                  index,
+                  cooldownUntil: state.store.accounts[index]?.cooldownUntil,
+                })
+                failures.push(response)
+                if (state.store.accounts.length > 1) continue
+              }
+
+              state.store.accounts[index].lastUsed = Date.now()
+              state.store.accounts[index].cooldownReason = undefined
+              state.store.accounts[index].cooldownUntil = undefined
+              state.store.activeIndex = index
+              state.store = await Store.write(state.store)
+              accountStore = state.store
+              await persistActiveAuth(input.client, state.store.accounts[index])
+              return response
+            }
+
+            const last = failures.at(-1)
+            if (last) return last
+
+            const fallbackHeaders = new Headers(baseHeaders)
+            if (currentAuth.access) fallbackHeaders.set("authorization", `Bearer ${currentAuth.access}`)
+            if (authAccount.accountId) {
+              fallbackHeaders.set("ChatGPT-Account-Id", authAccount.accountId)
+            }
+            return fetch(url, { ...(init ?? {}), headers: fallbackHeaders })
           },
         }
       },
@@ -480,6 +638,26 @@ export async function CodexAuthPlugin(input: PluginInput): Promise<Hooks> {
                 const tokens = await callbackPromise
                 stopOAuthServer()
                 const accountId = extractAccountId(tokens)
+                const email = extractEmailFromTokens(tokens)
+                const seeded =
+                  accountStore ??
+                  (await Store.ensure({
+                    refresh: tokens.refresh_token,
+                    access: tokens.access_token,
+                    expires: Date.now() + (tokens.expires_in ?? 3600) * 1000,
+                    accountId,
+                    email,
+                  }))
+                const insert = Store.upsert(seeded, {
+                  refresh: tokens.refresh_token,
+                  access: tokens.access_token,
+                  expires: Date.now() + (tokens.expires_in ?? 3600) * 1000,
+                  accountId,
+                  email,
+                })
+                insert.store.activeIndex = insert.index
+                accountStore = await Store.write(insert.store)
+                await persistActiveAuth(input.client, accountStore.accounts[insert.index])
                 return {
                   type: "success" as const,
                   refresh: tokens.refresh_token,
@@ -554,13 +732,34 @@ export async function CodexAuthPlugin(input: PluginInput): Promise<Hooks> {
                     }
 
                     const tokens: TokenResponse = await tokenResponse.json()
+                    const accountId = extractAccountId(tokens)
+                    const email = extractEmailFromTokens(tokens)
+                    const seeded =
+                      accountStore ??
+                      (await Store.ensure({
+                        refresh: tokens.refresh_token,
+                        access: tokens.access_token,
+                        expires: Date.now() + (tokens.expires_in ?? 3600) * 1000,
+                        accountId,
+                        email,
+                      }))
+                    const insert = Store.upsert(seeded, {
+                      refresh: tokens.refresh_token,
+                      access: tokens.access_token,
+                      expires: Date.now() + (tokens.expires_in ?? 3600) * 1000,
+                      accountId,
+                      email,
+                    })
+                    insert.store.activeIndex = insert.index
+                    accountStore = await Store.write(insert.store)
+                    await persistActiveAuth(input.client, accountStore.accounts[insert.index])
 
                     return {
                       type: "success" as const,
                       refresh: tokens.refresh_token,
                       access: tokens.access_token,
                       expires: Date.now() + (tokens.expires_in ?? 3600) * 1000,
-                      accountId: extractAccountId(tokens),
+                      accountId,
                     }
                   }
 
