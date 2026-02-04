@@ -9,7 +9,7 @@ import { SessionRevert } from "./revert"
 import { Session } from "."
 import { Agent } from "../agent/agent"
 import { Provider } from "../provider/provider"
-import { type Tool as AITool, tool, jsonSchema, type ToolCallOptions } from "ai"
+import { type Tool as AITool, tool, jsonSchema, type ToolCallOptions, asSchema } from "ai"
 import { SessionCompaction } from "./compaction"
 import { Instance } from "../project/instance"
 import { Bus } from "../bus"
@@ -62,7 +62,7 @@ export namespace SessionPrompt {
           abort: AbortController
           callbacks: {
             resolve(input: MessageV2.WithParts): void
-            reject(): void
+            reject(reason?: any): void
           }[]
         }
       > = {}
@@ -72,7 +72,7 @@ export namespace SessionPrompt {
       for (const item of Object.values(current)) {
         item.abort.abort()
         for (const callback of item.callbacks) {
-          callback.reject()
+          callback.reject(new DOMException("Aborted", "AbortError"))
         }
       }
     },
@@ -246,10 +246,13 @@ export namespace SessionPrompt {
     log.info("cancel", { sessionID })
     const s = state()
     const match = s[sessionID]
-    if (!match) return
+    if (!match) {
+      SessionStatus.set(sessionID, { type: "idle" })
+      return
+    }
     match.abort.abort()
     for (const item of match.callbacks) {
-      item.reject()
+      item.reject(new DOMException("Aborted", "AbortError"))
     }
     delete s[sessionID]
     SessionStatus.set(sessionID, { type: "idle" })
@@ -735,6 +738,8 @@ export namespace SessionPrompt {
       const execute = item.execute
       if (!execute) continue
 
+      const transformed = ProviderTransform.schema(input.model, asSchema(item.inputSchema).jsonSchema)
+      item.inputSchema = jsonSchema(transformed)
       // Wrap execute to add plugin hooks and format output
       item.execute = async (args, opts) => {
         const ctx = context(args, opts)
@@ -1495,12 +1500,15 @@ NOTE: At any point in time through this workflow you should feel free to ask the
     const matchingInvocation = invocations[shellName] ?? invocations[""]
     const args = matchingInvocation?.args
 
+    const cwd = Instance.directory
+    const shellEnv = await Plugin.trigger("shell.env", { cwd }, { env: {} })
     const proc = spawn(shell, args, {
-      cwd: Instance.directory,
+      cwd,
       detached: process.platform !== "win32",
       stdio: ["ignore", "pipe", "pipe"],
       env: {
         ...process.env,
+        ...shellEnv.env,
         TERM: "dumb",
       },
     })
